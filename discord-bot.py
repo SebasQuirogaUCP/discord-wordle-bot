@@ -5,8 +5,11 @@ import os
 import mysql.connector
 import json
 from typing import Any
-from datetime import date
-
+import cv2
+import numpy as np
+import base64
+from io import BytesIO
+from PIL import Image
 
 API_KEY = os.environ["OPEN_AI_TOKEN"]
 MYSQL_HOST = os.getenv('MYSQL_HOST')
@@ -23,13 +26,13 @@ def get_db_connection():
     )
     return connection
 
-def insert_data(data, discord_account, discord_username, email, birthdate):
+def insert_data(data, discord_account, discord_username):
     try:
         user_exists = check_user_exists(discord_account)
         print(f"User exists: {user_exists}")
 
         if not user_exists:
-            create_user(discord_account, discord_username, email, birthdate)
+            create_user(discord_account, discord_username)
             print("User created successfully: ", discord_account)
 
         insert_game_and_guesses(data, discord_account)
@@ -79,15 +82,14 @@ def insert_game_and_guesses(data, discord_account):
     cursor.close()
     connection.close()
 
-
-def create_user(discord_account, discord_username, email, birthdate):
+def create_user(discord_account, discord_username):
     connection = get_db_connection()
 
     cursor = connection.cursor()
 
     try: 
-        insert_user_query = "INSERT INTO players (discordAccount, discordUsername, email, birthdate) VALUES (%s, %s, %s, %s)"
-        cursor.execute(insert_user_query, (discord_account, discord_username, email, birthdate))
+        insert_user_query = "INSERT INTO players (discordAccount, discordUsername) VALUES (%s, %s)"
+        cursor.execute(insert_user_query, (discord_account, discord_username))
 
         connection.commit()
 
@@ -157,21 +159,92 @@ def process_gpt_response(response):
 def encode_image(image_data):
     return base64.b64encode(image_data).decode('utf-8')
 
-def ocr_image(base64_image):
+def image_to_base64(image):
+    """Convert an OpenCV image to a base64 string."""
+    _, buffer = cv2.imencode('.png', image)
+    return base64.b64encode(buffer).decode('utf-8')
+
+def base64_size_in_mb(base64_str):
+
+    # Decode the base64 string
+    binary_data = base64.b64decode(base64_str)
+
+    # Calculate the size in bytes
+    size_in_bytes = len(binary_data)
+
+    # Convert to megabytes
+    size_in_mb = size_in_bytes / (1024 * 1024)
+
+    print(size_in_mb)
+    return size_in_mb
+    
+def base64_to_image(base64_str):
+    """Convert base64 string to an OpenCV image."""
+    try:
+        # Validate if the base64 string is correctly formatted
+        if base64_str.startswith('data:image'):
+            header, base64_str = base64_str.split(',', 1)
+
+        # Decode the base64 string
+        image_data = base64.b64decode(base64_str)
+        image = Image.open(BytesIO(image_data))
+        return cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    except (base64.binascii.Error, UnidentifiedImageError) as e:
+        raise ValueError(f"Failed to decode base64 string or identify image: {e}")
+
+def process_image(base64_str):
+    # Convert base64 string to image
+    try:
+        image = base64_to_image(base64_str)
+    except ValueError as e:
+        return str(e)
+
+    # Define the color ranges
+    # Aqua Forest (approx. green)
+    aqua_forest_lower = np.array([40, 50, 50])
+    aqua_forest_upper = np.array([80, 255, 255])
+
+    # Goldenrod (approx. yellow)
+    goldenrod_lower = np.array([20, 100, 100])
+    goldenrod_upper = np.array([30, 255, 255])
+
+    # Convert image to HSV color space
+    hsv_image = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+
+    # Create masks for the color ranges
+    aqua_forest_mask = cv2.inRange(hsv_image, aqua_forest_lower, aqua_forest_upper)
+    goldenrod_mask = cv2.inRange(hsv_image, goldenrod_lower, goldenrod_upper)
+
+    # Define the new colors in BGR (OpenCV uses BGR by default)
+    new_green = np.array([0, 255, 0])  # Green
+    new_yellow = np.array([0, 255, 255])  # Yellow
+
+    # Change colors in the original image
+    image[aqua_forest_mask > 0] = new_green
+    image[goldenrod_mask > 0] = new_yellow
+
+    print("Image processed successfully.")
+    cv2.imwrite("./img.png", image)
+    
+    # Convert processed image back to base64
+    base64_size_in_mb(image)
+    return image_to_base64(image)
+    
+def ocr_image_initial(base64_image):
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {API_KEY}"
     }
 
     payload = {
-      "model": "gpt-4o",
+      "model": "gpt-4-turbo",
       "messages": [
         {
           "role": "user",
           "content": [
             {
               "type": "text",
-              "text": "You are an expert in OCR. You will receive an image of the results of a user playing Wordle. Your task is to extract all guesses and, if applicable, the color for each character, as the color is crucial for indicating whether the user got the correct letter (green), the correct letter in the wrong position (yellow) or the wrong possition and letter (black/gray). Read the letters horizontally from left to right and return the extracted data in an array of objects where each object represents a guess, containing its letters and their corresponding colors. Ignore any section showing a virtual phone keyboard and focus solely on the squares containing the guesses. Return the results in a valid JSON format. It is very important not to confuse the colors. JSON format with example: [{ attempt: 0, guess: [\"a\", \"b\", \"c\", \"d\", \"e\"], color: [\"black\", \"yellow\", \"green\", \"yellow\", \"black\"] }]."
+              "text": "Analyze the provided Wordle image and extract the information about the letters and their colors for each attempt. Identify each letter in the Wordle grid and determine the color associated with each letter: gray for letters not in the word, light-yellow for letters in the word but in the wrong position, and light-green for letters in the correct position. Organize the extracted information into a JSON array where each object represents an attempt, containing \"attempt\" (the attempt number, starting from 0), \"guess\" (an array of letters guessed), and \"color\" (an array of corresponding colors). Use the following format as an example: [{\"attempt\": 0, \"guess\": [\"s\", \"p\", \"a\", \"c\", \"e\"], \"color\": [\"gray\", \"gray\", \"yellow\", \"gray\", \"yellow\"]}, {\"attempt\": 1, \"guess\": [\"a\", \"u\", \"n\", \"t\", \"y\"], \"color\": [\"yellow\", \"yellow\", \"gray\", \"yellow\", \"gray\"]}, {\"attempt\": 2, \"guess\": [\"g\", \"r\", \"o\", \"a\", \"t\"], \"color\": [\"green\", \"green\", \"gray\", \"green\", \"green\"]}, {\"attempt\": 3, \"guess\": [\"g\", \"l\", \"o\", \"a\", \"t\"], \"color\": [\"green\", \"green\", \"green\", \"green\", \"green\"]}]. The colors should be represented as strings: \"gray\" for letters not in the word, \"yellow\" for letters in the word but in the wrong position, and \"green\" for letters in the correct position. Only answer with the valid JSON message. Do not add any extra information",
             },
             {
               "type": "image_url",
@@ -182,13 +255,77 @@ def ocr_image(base64_image):
           ]
         }
       ],
-      "max_tokens": 300
+      "max_tokens": 600
     }
 
     response = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
   
 
     return response.json()
+
+def convert_png_to_base64(image_path):
+    with open(image_path, "rb") as image_file:
+        encoded_string = base64.b64encode(image_file.read()).decode('utf-8')
+    return encoded_string
+
+def ocr_image(base64_image):
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {API_KEY}"
+    }
+    example_base64_image = convert_png_to_base64("./example_image.png")
+    
+    example_interpretation = {
+        "example_image": example_base64_image,
+        "correct_interpretation": [
+            {
+                "attempt": 0,
+                "guess": ["H", "A", "P", "P", "Y"],
+                "color": ["gray", "gray", "yellow", "gray", "green"]
+            },
+            {
+                "attempt": 1,
+                "guess": ["P", "R", "I", "C", "E"],
+                "color": ["green", "gray", "yellow", "gray", "yellow"]
+            },
+            {
+                "attempt": 2,
+                "guess": ["P", "I", "E", "T", "Y"],
+                "color": ["green", "green", "green", "green", "green"]
+            }
+        ]
+    }
+
+    system_message = {
+        "role": "system",
+        "content": (
+            "Analyze the provided Wordle image and extract the information about the letters and their colors for each attempt. "
+            "Identify each letter in the Wordle grid and determine the color associated with each letter: gray for letters not in the word, "
+            "yellow for letters in the word but in the wrong position, and green for letters in the correct position. "
+            "Organize the extracted information into a JSON array where each object represents an attempt, containing \"attempt\" (the attempt number, starting from 0), "
+            "\"guess\" (an array of letters guessed), and \"color\" (an array of corresponding colors). "
+            "Use the following format as an example: [{\"attempt\": 0, \"guess\": [\"H\", \"A\", \"P\", \"P\", \"Y\"], \"color\": [\"gray\", \"gray\", \"yellow\", \"gray\", \"green\"]}]. "
+            "The colors should be represented as strings: \"gray\" for letters not in the word, \"yellow\" for letters in the word but in the wrong position, and \"green\" for letters in the correct position. "
+            "Only answer with the valid JSON message. Do not add any extra information. Here is an example image and its correct interpretation for reference: "
+            f"{example_interpretation}"
+        )
+    }
+
+    user_message = {
+        "role": "user",
+        "content": f"data:image/jpeg;base64,{base64_image}"
+    }
+
+    payload = {
+        "model": "gpt-4-turbo",
+        "messages": [system_message, user_message],
+        "max_tokens": 600
+    }
+
+    response = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload)
+
+    return response.json()
+
 
 intents = discord.Intents.default()
 intents.message_content = True
@@ -203,32 +340,37 @@ async def on_message(message):
     if message.author == client.user:
         return
 
-    if message.content.startswith('/ocr') and message.attachments:
+    if message.content.startswith('/wordle') and message.attachments:
         attachment = message.attachments[0]
 
         if attachment.content_type.startswith('image'):
             
             image_response = requests.get(attachment.url)
             if image_response.status_code == 200:
-                image_data = image_response.content
-                base64_image = encode_image(image_data)
-
+                
                 username = message.author.name
                 discriminator = message.author.discriminator
                 discord_username = message.author.display_name
                 discord_account = f"{username}#{discriminator}"
                 
+                image_data = image_response.content
+                
+                #base64_image = encode_image(image_data)
+                base64_image = process_image(encode_image(image_data))
+
                 print(f"Discord Account: {discord_account} (Discord User: {discord_username})")
 
+                #result = ocr_image(base64_image)['choices'][0]['message']['content']
+                temp = ocr_image(base64_image)
+                print(temp)
                 result = ocr_image(base64_image)['choices'][0]['message']['content']
-
-                print(result)
 
                 response_cleaned = result.replace("```json", "").replace("```","")
 
-                response_casted = json.loads(response_cleaned)
-                           
-                insert_data(response_casted, discord_account, discord_username, "email", date(2024, 5, 28))
+                print(f"{response_cleaned}")
+                
+                #response_casted = json.loads(response_cleaned)          
+                #insert_data(response_casted, discord_account, discord_username)
 
 
                 await message.channel.send(result)
